@@ -1,0 +1,927 @@
+import csv
+import hashlib
+import hmac
+import os
+import re
+import uuid
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+
+APP_NAME = "NovaCart"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PRODUCT_FILE = os.path.join(BASE_DIR, "products.csv")
+ORDER_FILE = os.path.join(BASE_DIR, "orders.csv")
+USER_FILE = os.path.join(BASE_DIR, "users.csv")
+
+# ---- Admin credentials (change these) ----
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "Admin@123"
+
+# Dark palette
+BG = "#0B1020"
+SURFACE = "#111A2E"
+CARD = "#17233A"
+ENTRY_BG = "#0D1628"
+BORDER = "#263650"
+TEXT = "#E8EEF9"
+MUTED = "#91A0B8"
+ACCENT = "#8B7CFF"
+ACCENT_HOVER = "#7565F2"
+TEAL = "#51D6B2"
+RED = "#FF7189"
+AMBER = "#FFC857"
+
+FONT = ("Segoe UI", 10)
+SMALL = ("Segoe UI", 9)
+HEADING = ("Segoe UI", 25, "bold")
+SUBHEADING = ("Segoe UI", 14, "bold")
+
+PRODUCTS = [
+    {"id": "P001", "name": "Laptop", "category": "Electronics", "price": 55000, "stock": 10, "emoji": "💻"},
+    {"id": "P002", "name": "Headphones", "category": "Electronics", "price": 2000, "stock": 20, "emoji": "🎧"},
+    {"id": "P003", "name": "T-Shirt", "category": "Fashion", "price": 800, "stock": 30, "emoji": "👕"},
+    {"id": "P004", "name": "Shoes", "category": "Fashion", "price": 2500, "stock": 15, "emoji": "👟"},
+    {"id": "P005", "name": "Smart Watch", "category": "Electronics", "price": 3500, "stock": 12, "emoji": "⌚"},
+    {"id": "P006", "name": "Keyboard", "category": "Electronics", "price": 1200, "stock": 25, "emoji": "⌨️"},
+    {"id": "P007", "name": "Backpack", "category": "Accessories", "price": 1500, "stock": 18, "emoji": "🎒"},
+    {"id": "P008", "name": "Camera", "category": "Electronics", "price": 18000, "stock": 8, "emoji": "📷"},
+]
+PRODUCT_FIELDS = ["id", "name", "category", "price", "stock", "emoji"]
+ORDER_FIELDS = ["order_id", "date", "customer", "username", "address", "items", "total",
+                "payment_method", "status"]
+USER_FIELDS = ["username", "full_name", "salt", "password_hash"]
+ORDER_STATUSES = ["Demo order placed", "Shipped", "Delivered"]
+
+
+def money(amount):
+    return "₹{:,.2f}".format(float(amount))
+
+
+def hash_password(password, salt_hex):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               bytes.fromhex(salt_hex), 100_000).hex()
+
+
+def safe_equal(a, b):
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+class NovaCartApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("NovaCart | Online Shopping")
+        self.geometry("1180x800")
+        self.minsize(960, 700)
+        self.configure(bg=BG)
+        self.products = self.load_products()
+        self.cart = {}
+        self.current_user = None      # username of logged-in customer
+        self.customer_name = ""
+        self.is_admin = False
+        self.address_text = None
+        self.payment_method = tk.StringVar(value="UPI")
+        self.search_text = tk.StringVar()
+        self.category = tk.StringVar(value="All")
+        self.last_order = None
+        self.configure_styles()
+        self.show_login()
+
+    def configure_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT,
+                        rowheight=38, font=FONT, borderwidth=0)
+        style.configure("Treeview.Heading", background=SURFACE, foreground=MUTED,
+                        font=("Segoe UI", 9, "bold"), relief="flat")
+        style.map("Treeview", background=[("selected", ACCENT)],
+                  foreground=[("selected", "#FFFFFF")])
+        style.configure("TCombobox", fieldbackground=ENTRY_BG, background=ENTRY_BG,
+                        foreground=TEXT, arrowcolor=ACCENT, bordercolor=BORDER,
+                        lightcolor=BORDER, darkcolor=BORDER, padding=8)
+        style.map("TCombobox", fieldbackground=[("readonly", ENTRY_BG)],
+                  foreground=[("readonly", TEXT)], selectbackground=[("readonly", ENTRY_BG)],
+                  selectforeground=[("readonly", TEXT)])
+        style.configure("Vertical.TScrollbar", background=SURFACE, troughcolor=CARD,
+                        arrowcolor=MUTED, bordercolor=CARD, lightcolor=SURFACE, darkcolor=SURFACE)
+
+    # ------------------------------------------------------------------ data
+    def load_products(self):
+        if not os.path.exists(PRODUCT_FILE):
+            self.products = [p.copy() for p in PRODUCTS]
+            self.save_products()
+            return self.products
+        try:
+            with open(PRODUCT_FILE, "r", newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+            loaded = [{"id": r["id"], "name": r["name"], "category": r["category"],
+                       "price": float(r["price"]), "stock": int(r["stock"]),
+                       "emoji": r.get("emoji") or "🛍️"} for r in rows]
+            return loaded
+        except (OSError, ValueError, KeyError):
+            messagebox.showwarning("Product data", "products.csv could not be read. Default products will be used.")
+            return [p.copy() for p in PRODUCTS]
+
+    def save_products(self):
+        with open(PRODUCT_FILE, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=PRODUCT_FIELDS)
+            writer.writeheader()
+            writer.writerows(self.products)
+
+    def read_orders(self):
+        if not os.path.exists(ORDER_FILE):
+            return []
+        try:
+            with open(ORDER_FILE, "r", newline="", encoding="utf-8") as file:
+                return list(csv.DictReader(file))
+        except OSError:
+            return []
+
+    def write_orders(self, orders):
+        with open(ORDER_FILE, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=ORDER_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for row in orders:
+                writer.writerow({field: row.get(field, "") for field in ORDER_FIELDS})
+
+    def save_order(self, order):
+        orders = self.read_orders()
+        orders.append(order)
+        self.write_orders(orders)
+
+    def load_users(self):
+        if not os.path.exists(USER_FILE):
+            return {}
+        try:
+            with open(USER_FILE, "r", newline="", encoding="utf-8") as file:
+                return {r["username"]: r for r in csv.DictReader(file)}
+        except (OSError, KeyError):
+            return {}
+
+    def save_user(self, username, full_name, password):
+        salt = os.urandom(16).hex()
+        row = {"username": username, "full_name": full_name, "salt": salt,
+               "password_hash": hash_password(password, salt)}
+        new_file = not os.path.exists(USER_FILE)
+        with open(USER_FILE, "a", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=USER_FIELDS)
+            if new_file:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def product_by_id(self, pid):
+        return next((p for p in self.products if p["id"] == pid), None)
+
+    def categories(self):
+        return sorted({p["category"] for p in self.products})
+
+    # ------------------------------------------------------------ UI helpers
+    def clear_screen(self):
+        self.unbind("<Return>")
+        for widget in self.winfo_children():
+            widget.destroy()
+
+    def button(self, parent, text, command, primary=True, compact=False, danger=False):
+        bg = RED if danger else (ACCENT if primary else CARD)
+        fg = "#0B1020" if danger else ("#FFFFFF" if primary else TEXT)
+        return tk.Button(parent, text=text, command=command, font=("Segoe UI", 10, "bold"),
+                         bg=bg, fg=fg,
+                         activebackground="#E85A72" if danger else (ACCENT_HOVER if primary else "#1D2B45"),
+                         activeforeground=fg if danger else "#FFFFFF", relief="flat", bd=0, cursor="hand2",
+                         padx=15 if compact else 18, pady=8 if compact else 11,
+                         highlightthickness=1 if not (primary or danger) else 0, highlightbackground=BORDER)
+
+    def link_button(self, parent, text, command, bg=CARD):
+        return tk.Button(parent, text=text, command=command, font=SMALL, bg=bg, fg=ACCENT,
+                         activebackground=bg, activeforeground=ACCENT_HOVER, relief="flat",
+                         bd=0, cursor="hand2")
+
+    def label(self, parent, text, font=FONT, color=TEXT, **kwargs):
+        return tk.Label(parent, text=text, font=font, fg=color,
+                        bg=kwargs.pop("bg", SURFACE), **kwargs)
+
+    def panel(self, parent, **kwargs):
+        return tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER, **kwargs)
+
+    def heading(self, parent, title, subtitle=None):
+        self.label(parent, title, HEADING, TEXT, bg=BG).pack(anchor="w", pady=(12, 4))
+        if subtitle:
+            self.label(parent, subtitle, FONT, MUTED, bg=BG).pack(anchor="w", pady=(0, 17))
+
+    def make_tree(self, parent, headers, **kwargs):
+        tree = ttk.Treeview(parent, columns=list(headers), show="headings", **kwargs)
+        for col, (title, width) in headers.items():
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor="w")
+        scroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+        return tree
+
+    def topbar(self):
+        bar = tk.Frame(self, bg=SURFACE, height=70, highlightthickness=1, highlightbackground=BORDER)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self.label(bar, "◈  NovaCart", ("Segoe UI", 19, "bold"), ACCENT, bg=SURFACE).pack(side="left", padx=24)
+        self.button(bar, "Shop", self.show_shop, False, True).pack(side="left", padx=5, pady=13)
+        self.button(bar, "📦  My Orders", self.show_order_history, False, True).pack(side="left", padx=5, pady=13)
+        self.button(bar, "Logout", self.logout, False, True).pack(side="right", padx=(0, 22), pady=13)
+        self.button(bar, f"🛒  Cart  ·  {sum(self.cart.values())}", self.show_cart, True, True).pack(side="right", padx=8, pady=13)
+        self.label(bar, f"Hi, {self.customer_name}", FONT, MUTED, bg=SURFACE).pack(side="right", padx=12)
+
+    def admin_topbar(self, active):
+        bar = tk.Frame(self, bg=SURFACE, height=70, highlightthickness=1, highlightbackground=BORDER)
+        bar.pack(fill="x")
+        bar.pack_propagate(False)
+        self.label(bar, "◈  NovaCart", ("Segoe UI", 19, "bold"), ACCENT, bg=SURFACE).pack(side="left", padx=(24, 8))
+        self.label(bar, " ADMIN ", ("Segoe UI", 9, "bold"), "#0B1020", bg=AMBER).pack(side="left", padx=(0, 20))
+        self.button(bar, "📦  Products & Stock", self.show_admin_products, active == "products", True).pack(side="left", padx=5, pady=13)
+        self.button(bar, "🧾  All Orders", self.show_admin_orders, active == "orders", True).pack(side="left", padx=5, pady=13)
+        self.button(bar, "Logout", self.logout, False, True).pack(side="right", padx=22, pady=13)
+
+    def content_area(self):
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=30, pady=15)
+        return outer
+
+    def dark_entry(self, parent, variable=None, **kwargs):
+        return tk.Entry(parent, textvariable=variable, font=FONT, bg=ENTRY_BG, fg=TEXT,
+                        insertbackground=TEXT, relief="flat", highlightthickness=1,
+                        highlightbackground=BORDER, highlightcolor=ACCENT, **kwargs)
+
+    # ------------------------------------------------------- login / register
+    def show_login(self, mode="login"):
+        """mode: 'login' (customer), 'register', or 'admin'."""
+        self.clear_screen()
+        wrapper = tk.Frame(self, bg=BG)
+        wrapper.pack(fill="both", expand=True)
+        self.label(wrapper, "◈  NovaCart", ("Segoe UI", 17, "bold"), ACCENT, bg=BG).pack(pady=(35, 14))
+        card = self.panel(wrapper, padx=44, pady=32)
+        card.pack(pady=10)
+
+        titles = {"login": ("Welcome back.", "Sign in to continue shopping."),
+                  "register": ("Create your account.", "It only takes a moment."),
+                  "admin": ("Admin sign in.", "Manage products, stock and orders.")}
+        title, sub = titles[mode]
+        tag = {"login": "CUSTOMER LOGIN", "register": "NEW ACCOUNT", "admin": "ADMIN ACCESS"}[mode]
+        self.label(card, tag, SMALL, AMBER if mode == "admin" else ACCENT, bg=CARD).pack(anchor="w", pady=(0, 6))
+        self.label(card, title, ("Segoe UI", 26, "bold"), TEXT, bg=CARD).pack(anchor="w")
+        self.label(card, sub, FONT, MUTED, bg=CARD).pack(anchor="w", pady=(6, 20))
+
+        def field(text, show=None):
+            self.label(card, text, ("Segoe UI", 10, "bold"), TEXT, bg=CARD).pack(anchor="w", pady=(0, 6))
+            entry = self.dark_entry(card, width=42, show=show or "")
+            entry.pack(fill="x", ipady=10, pady=(0, 12))
+            return entry
+
+        self.name_entry = field("Full name") if mode == "register" else None
+        self.user_entry = field("Username")
+        self.pass_entry = field("Password", "•")
+        self.confirm_entry = field("Confirm password", "•") if mode == "register" else None
+
+        def toggle_show():
+            char = "" if show_var.get() else "•"
+            self.pass_entry.config(show=char)
+            if self.confirm_entry:
+                self.confirm_entry.config(show=char)
+
+        show_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(card, text="Show password", variable=show_var, command=toggle_show,
+                       font=SMALL, bg=CARD, fg=MUTED, activebackground=CARD, activeforeground=TEXT,
+                       selectcolor=ENTRY_BG, highlightthickness=0).pack(anchor="w", pady=(0, 14))
+
+        if mode == "register":
+            submit = self.handle_register
+            self.button(card, "Create account  →", submit).pack(fill="x")
+            self.link_button(card, "Already have an account? Sign in", lambda: self.show_login("login")).pack(pady=(12, 0))
+        elif mode == "admin":
+            submit = self.handle_admin_login
+            self.button(card, "Sign in as admin  →", submit).pack(fill="x")
+            self.link_button(card, "← Back to customer login", lambda: self.show_login("login")).pack(pady=(12, 0))
+        else:
+            submit = self.handle_login
+            self.button(card, "Sign in  →", submit).pack(fill="x")
+            self.link_button(card, "New here? Create an account", lambda: self.show_login("register")).pack(pady=(12, 0))
+
+        self.bind("<Return>", lambda event: submit())
+        if mode != "admin":
+            self.link_button(wrapper, "Admin login", lambda: self.show_login("admin"), BG).pack(pady=(8, 0))
+        self.label(wrapper, "A LOCAL SHOPPING DEMO  ·  NO REAL PAYMENTS", SMALL, MUTED, bg=BG).pack(pady=14)
+        (self.name_entry or self.user_entry).focus_set()
+
+    def start_session(self, username, display_name, admin=False):
+        self.current_user = username
+        self.customer_name = display_name
+        self.is_admin = admin
+        self.cart = {}
+        self.search_text.set("")
+        self.category.set("All")
+        if admin:
+            self.show_admin_products()
+        else:
+            self.show_shop()
+
+    def handle_register(self):
+        full_name = self.name_entry.get().strip()
+        username = self.user_entry.get().strip().lower()
+        password = self.pass_entry.get()
+        confirm = self.confirm_entry.get()
+        if not full_name:
+            messagebox.showwarning("Name required", "Please enter your full name.")
+            return
+        if not re.fullmatch(r"[a-z0-9_.]{3,20}", username):
+            messagebox.showwarning("Invalid username",
+                                   "Username must be 3-20 characters: letters, numbers, dot or underscore.")
+            return
+        if safe_equal(username, ADMIN_USERNAME.lower()) or username in self.load_users():
+            messagebox.showwarning("Username taken", "That username is already in use. Try another one.")
+            return
+        if len(password) < 6:
+            messagebox.showwarning("Weak password", "Password must be at least 6 characters.")
+            return
+        if password != confirm:
+            messagebox.showwarning("Mismatch", "Passwords do not match.")
+            return
+        try:
+            self.save_user(username, full_name, password)
+        except OSError as error:
+            messagebox.showerror("Could not create account", str(error))
+            return
+        messagebox.showinfo("Account created", "Your account is ready. Please sign in.")
+        self.show_login("login")
+
+    def handle_login(self):
+        username = self.user_entry.get().strip().lower()
+        password = self.pass_entry.get()
+        if not username or not password:
+            messagebox.showwarning("Missing details", "Enter your username and password.")
+            return
+        user = self.load_users().get(username)
+        if not user or not safe_equal(hash_password(password, user["salt"]), user["password_hash"]):
+            messagebox.showerror("Login failed", "Incorrect username or password.")
+            self.pass_entry.delete(0, "end")
+            return
+        self.start_session(username, user["full_name"])
+
+    def handle_admin_login(self):
+        username = self.user_entry.get().strip()
+        password = self.pass_entry.get()
+        if safe_equal(username, ADMIN_USERNAME) and safe_equal(password, ADMIN_PASSWORD):
+            self.start_session(ADMIN_USERNAME, "Admin", admin=True)
+        else:
+            messagebox.showerror("Login failed", "Incorrect admin ID or password.")
+            self.pass_entry.delete(0, "end")
+
+    def logout(self):
+        if self.cart and not self.is_admin:
+            if not messagebox.askyesno("Logout", "Your cart will be cleared. Log out anyway?"):
+                return
+        self.current_user = None
+        self.customer_name = ""
+        self.is_admin = False
+        self.cart = {}
+        self.show_login()
+
+    # ------------------------------------------------------------------ shop
+    def show_shop(self):
+        self.clear_screen()
+        self.topbar()
+        content = self.content_area()
+        self.heading(content, f"Welcome, {self.customer_name}  ✨", "Find something you'll love. Browse the collection below.")
+        search_row = tk.Frame(content, bg=BG)
+        search_row.pack(fill="x", pady=(0, 12))
+        search = self.dark_entry(search_row, self.search_text)
+        search.pack(side="left", fill="x", expand=True, ipady=11, padx=(0, 12))
+        search.bind("<KeyRelease>", lambda event: self.render_products())
+        chooser = ttk.Combobox(search_row, textvariable=self.category,
+                               values=["All"] + self.categories(), state="readonly", width=18)
+        chooser.pack(side="right", ipady=5)
+        chooser.bind("<<ComboboxSelected>>", lambda event: self.render_products())
+        self.product_area = tk.Frame(content, bg=BG)
+        self.product_area.pack(fill="both", expand=True)
+        self.render_products()
+        self.label(content, "🔒 Demo checkout    ·    📦 Orders saved on this computer    ·    Made with Python",
+                   SMALL, MUTED, bg=BG).pack(pady=(14, 2))
+
+    def render_products(self):
+        if not hasattr(self, "product_area"):
+            return
+        for widget in self.product_area.winfo_children():
+            widget.destroy()
+        query = self.search_text.get().strip().lower()
+        category = self.category.get()
+        matches = [p for p in self.products if query in p["name"].lower()
+                   and (category == "All" or p["category"] == category)]
+        if not matches:
+            self.label(self.product_area, "No products found. Try a different search.", SUBHEADING, MUTED, bg=BG).pack(pady=50)
+            return
+        for index, product in enumerate(matches):
+            row, col = divmod(index, 4)
+            card = self.panel(self.product_area, padx=12, pady=12)
+            card.grid(row=row, column=col, padx=6, pady=7, sticky="nsew")
+            self.product_area.grid_columnconfigure(col, weight=1, uniform="product")
+            art = tk.Frame(card, bg=ENTRY_BG, height=88)
+            art.pack(fill="x", pady=(0, 10))
+            art.pack_propagate(False)
+            self.label(art, product["emoji"], ("Segoe UI Emoji", 34), TEXT, bg=ENTRY_BG).pack(expand=True)
+            self.label(card, product["name"], ("Segoe UI", 11, "bold"), TEXT, bg=CARD).pack(anchor="w")
+            self.label(card, product["category"], SMALL, MUTED, bg=CARD).pack(anchor="w", pady=(2, 6))
+            self.label(card, money(product["price"]), ("Segoe UI", 13, "bold"), ACCENT, bg=CARD).pack(anchor="w")
+            stocked = product["stock"] > 0
+            self.label(card, f"●  {product['stock']} in stock" if stocked else "Out of stock",
+                       SMALL, TEAL if stocked else RED, bg=CARD).pack(anchor="w", pady=(5, 9))
+            self.button(card, "+  Add to cart", lambda p=product: self.add_to_cart(p["id"]),
+                        stocked, True).pack(fill="x")
+
+    def add_to_cart(self, product_id):
+        product = self.product_by_id(product_id)
+        if not product or product["stock"] <= 0:
+            messagebox.showwarning("Unavailable", "This product is out of stock.")
+            return
+        if self.cart.get(product_id, 0) >= product["stock"]:
+            messagebox.showwarning("Stock limit", "You have reached the available stock limit.")
+            return
+        self.cart[product_id] = self.cart.get(product_id, 0) + 1
+        self.show_shop()
+
+    # ------------------------------------------------------------------ cart
+    def cart_total(self):
+        return sum(self.product_by_id(pid)["price"] * qty for pid, qty in self.cart.items())
+
+    def prune_cart(self):
+        """Drop items an admin may have deleted or whose stock has dropped."""
+        for pid in list(self.cart):
+            product = self.product_by_id(pid)
+            if product is None or product["stock"] <= 0:
+                del self.cart[pid]
+            elif self.cart[pid] > product["stock"]:
+                self.cart[pid] = product["stock"]
+
+    def show_cart(self):
+        self.prune_cart()
+        self.clear_screen()
+        self.topbar()
+        content = self.content_area()
+        self.heading(content, "Your shopping cart", "Review your picks before moving to delivery details.")
+        if not self.cart:
+            card = self.panel(content, padx=28, pady=30)
+            card.pack(fill="x", pady=10)
+            self.label(card, "Your cart is waiting for something great.", SUBHEADING, MUTED, bg=CARD).pack(anchor="w")
+            self.button(card, "←  Browse products", self.show_shop).pack(anchor="w", pady=(18, 0))
+            return
+        table = self.panel(content, padx=12, pady=12)
+        table.pack(fill="both", expand=True)
+        headers = {"name": ("Product", 250), "category": ("Category", 170), "price": ("Unit price", 150),
+                   "quantity": ("Qty", 100), "subtotal": ("Subtotal", 170)}
+        tree = self.make_tree(table, headers, selectmode="browse")
+        for pid, qty in self.cart.items():
+            p = self.product_by_id(pid)
+            tree.insert("", "end", iid=pid, values=(f"{p['emoji']}  {p['name']}", p["category"],
+                        money(p["price"]), qty, money(p["price"] * qty)))
+        controls = tk.Frame(content, bg=BG)
+        controls.pack(fill="x", pady=12)
+        self.button(controls, "+ Increase", lambda: self.change_quantity(tree, 1), False, True).pack(side="left", padx=(0, 7))
+        self.button(controls, "− Decrease", lambda: self.change_quantity(tree, -1), False, True).pack(side="left", padx=7)
+        self.button(controls, "Remove", lambda: self.remove_item(tree), False, True).pack(side="left", padx=7)
+        bottom = self.panel(content, padx=16, pady=12)
+        bottom.pack(fill="x", pady=4)
+        self.label(bottom, f"Order total   {money(self.cart_total())}", ("Segoe UI", 16, "bold"), ACCENT, bg=CARD).pack(side="left")
+        self.button(bottom, "Delivery & payment  →", self.show_payment).pack(side="right")
+
+    def change_quantity(self, tree, change):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("Select item", "Select a product first.")
+            return
+        pid = selected[0]
+        product = self.product_by_id(pid)
+        quantity = self.cart[pid] + change
+        if quantity <= 0:
+            del self.cart[pid]
+        elif quantity > product["stock"]:
+            messagebox.showwarning("Stock limit", "Not enough stock available.")
+            return
+        else:
+            self.cart[pid] = quantity
+        self.show_cart()
+
+    def remove_item(self, tree):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("Select item", "Select a product first.")
+            return
+        self.cart.pop(selected[0], None)
+        self.show_cart()
+
+    # ------------------------------------------------------ address & payment
+    def show_payment(self):
+        self.prune_cart()
+        if not self.cart:
+            messagebox.showwarning("Empty cart", "Add products before checkout.")
+            self.show_cart()
+            return
+        self.clear_screen()
+        self.topbar()
+        content = self.content_area()
+        self.heading(content, "Delivery & payment", "Add your delivery address, then choose a demo payment method.")
+        columns = tk.Frame(content, bg=BG)
+        columns.pack(fill="both", expand=True)
+        left = self.panel(columns, padx=22, pady=20)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 9))
+        right = self.panel(columns, padx=22, pady=20)
+        right.pack(side="right", fill="both", expand=True, padx=(9, 0))
+
+        self.label(left, "01  DELIVERY DETAILS", SMALL, ACCENT, bg=CARD).pack(anchor="w", pady=(0, 5))
+        self.label(left, "Where should we send it?", SUBHEADING, TEXT, bg=CARD).pack(anchor="w", pady=(0, 5))
+        self.label(left, f"Delivering for  {self.customer_name}", FONT, MUTED, bg=CARD).pack(anchor="w", pady=(0, 14))
+        self.label(left, "Full delivery address", ("Segoe UI", 10, "bold"), TEXT, bg=CARD).pack(anchor="w", pady=(0, 7))
+        self.address_text = tk.Text(left, height=6, wrap="word", font=FONT, bg=ENTRY_BG, fg=TEXT,
+                                    insertbackground=TEXT, relief="flat", padx=10, pady=10,
+                                    highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        self.address_text.pack(fill="x")
+        self.label(left, "Include house/building, street, city, state and PIN code.", SMALL, MUTED, bg=CARD).pack(anchor="w", pady=(7, 14))
+        self.label(left, "PAYMENT METHOD", SMALL, ACCENT, bg=CARD).pack(anchor="w", pady=(2, 8))
+        for value, title in [("UPI", "UPI  ·  Demo"), ("Card", "Credit / debit card  ·  Demo"),
+                             ("Cash on Delivery", "Cash on delivery")]:
+            tk.Radiobutton(left, text=title, variable=self.payment_method, value=value,
+                           font=FONT, bg=CARD, fg=TEXT, activebackground=CARD,
+                           activeforeground=TEXT, selectcolor=ENTRY_BG,
+                           highlightthickness=0).pack(anchor="w", pady=4)
+        self.label(left, "Demo only: no real payment is processed. Do not enter banking details.",
+                   SMALL, MUTED, bg=CARD, wraplength=430, justify="left").pack(anchor="w", pady=(9, 0))
+
+        self.label(right, "02  ORDER SUMMARY", SMALL, ACCENT, bg=CARD).pack(anchor="w", pady=(0, 8))
+        self.label(right, "Your items", SUBHEADING, TEXT, bg=CARD).pack(anchor="w", pady=(0, 12))
+        for pid, qty in self.cart.items():
+            product = self.product_by_id(pid)
+            row = tk.Frame(right, bg=CARD)
+            row.pack(fill="x", pady=6)
+            self.label(row, f"{product['emoji']}  {product['name']}  × {qty}", FONT, TEXT, bg=CARD).pack(side="left")
+            self.label(row, money(product["price"] * qty), FONT, MUTED, bg=CARD).pack(side="right")
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=16)
+        delivery = tk.Frame(right, bg=CARD)
+        delivery.pack(fill="x")
+        self.label(delivery, "Delivery", FONT, MUTED, bg=CARD).pack(side="left")
+        self.label(delivery, "FREE", FONT, TEAL, bg=CARD).pack(side="right")
+        tk.Frame(right, bg=BORDER, height=1).pack(fill="x", pady=16)
+        self.label(right, "TOTAL", SMALL, MUTED, bg=CARD).pack(anchor="w")
+        self.label(right, money(self.cart_total()), ("Segoe UI", 23, "bold"), ACCENT, bg=CARD).pack(anchor="w", pady=(3, 14))
+        self.label(right, "Your name and address will be saved with this order on this computer.",
+                   SMALL, MUTED, bg=CARD, wraplength=400, justify="left").pack(anchor="w")
+        actions = tk.Frame(content, bg=BG)
+        actions.pack(fill="x", pady=(14, 0))
+        self.button(actions, "←  Back to cart", self.show_cart, False).pack(side="left")
+        self.button(actions, "Place demo order  ✓", self.place_order).pack(side="right")
+
+    def place_order(self):
+        if not self.cart:
+            messagebox.showwarning("Empty cart", "Your cart is empty.")
+            self.show_cart()
+            return
+        address = self.address_text.get("1.0", "end").strip() if self.address_text else ""
+        if len(address) < 10:
+            messagebox.showwarning("Address required", "Please enter a complete delivery address.")
+            self.address_text.focus_set()
+            return
+        for pid, qty in self.cart.items():
+            product = self.product_by_id(pid)
+            if product is None or qty > product["stock"]:
+                messagebox.showerror("Stock changed", "An item is no longer available in that quantity. Please review your cart.")
+                self.show_cart()
+                return
+        total = self.cart_total()
+        if not messagebox.askyesno("Confirm order", f"Place your demo order for {money(total)}?"):
+            return
+        order_id = "NC-" + uuid.uuid4().hex[:8].upper()
+        order_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        method = self.payment_method.get()
+        item_summary = "; ".join(f"{self.product_by_id(pid)['name']} x{qty}" for pid, qty in self.cart.items())
+        for pid, qty in self.cart.items():
+            self.product_by_id(pid)["stock"] -= qty
+        order = {"order_id": order_id, "date": order_date, "customer": self.customer_name,
+                 "username": self.current_user, "address": address.replace("\n", ", "),
+                 "items": item_summary, "total": f"{total:.2f}", "payment_method": method,
+                 "status": ORDER_STATUSES[0]}
+        try:
+            self.save_products()
+            self.save_order(order)
+        except OSError as error:
+            for pid, qty in self.cart.items():
+                self.product_by_id(pid)["stock"] += qty
+            try:
+                self.save_products()
+            except OSError:
+                pass
+            messagebox.showerror("Could not save order", f"Your order was not confirmed because saving failed.\n{error}")
+            return
+        self.last_order = {"order_id": order_id, "date": order_date, "total": total,
+                           "method": method, "items": item_summary}
+        self.cart.clear()
+        self.show_success()
+
+    # ------------------------------------------------- confirmation & history
+    def show_success(self):
+        self.clear_screen()
+        panel = tk.Frame(self, bg=BG)
+        panel.pack(fill="both", expand=True)
+        self.label(panel, "✓", ("Segoe UI", 30, "bold"), TEAL, bg=BG).pack(pady=(45, 4))
+        self.label(panel, "Order placed successfully", ("Segoe UI", 25, "bold"), TEXT, bg=BG).pack(pady=4)
+        self.label(panel, f"Thanks, {self.customer_name}. Your order is on its way.", FONT, MUTED, bg=BG).pack(pady=(0, 20))
+        details = self.panel(panel, padx=32, pady=24)
+        details.pack(padx=25)
+        self.label(details, "ORDER CONFIRMATION", SMALL, ACCENT, bg=CARD).pack(anchor="w", pady=(0, 12))
+        for title, value in [("Order ID", self.last_order["order_id"]), ("Date", self.last_order["date"]),
+                             ("Items", self.last_order["items"]),
+                             ("Total", money(self.last_order["total"])), ("Payment", self.last_order["method"]),
+                             ("Status", ORDER_STATUSES[0])]:
+            row = tk.Frame(details, bg=CARD)
+            row.pack(fill="x", pady=5)
+            self.label(row, title, FONT, MUTED, bg=CARD, width=14, anchor="w").pack(side="left")
+            self.label(row, value, FONT, TEXT, bg=CARD, anchor="w", wraplength=420, justify="left").pack(side="left")
+        self.label(panel, "Your order and delivery details were saved in orders.csv.", SMALL, MUTED, bg=BG).pack(pady=15)
+        self.button(panel, "Continue shopping", self.show_shop).pack(pady=6)
+        self.button(panel, "View my orders", self.show_order_history, False).pack(pady=5)
+
+    def attach_order_detail(self, tree, orders, parent):
+        """Show address + full items for the selected order under the table."""
+        by_id = {o.get("order_id", ""): o for o in orders}
+        detail = tk.StringVar(value="Select an order to see its delivery address and items.")
+        box = self.panel(parent, padx=16, pady=10)
+        box.pack(fill="x", pady=(10, 0))
+        self.label(box, "", FONT, MUTED, bg=CARD, textvariable=detail, wraplength=980,
+                   justify="left", anchor="w").pack(fill="x")
+
+        def on_select(_event):
+            selected = tree.selection()
+            if selected and selected[0] in by_id:
+                o = by_id[selected[0]]
+                detail.set(f"Items: {o.get('items', '')}\nDeliver to: {o.get('address', '') or '—'}")
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+    def show_order_history(self):
+        self.clear_screen()
+        self.topbar()
+        content = self.content_area()
+        self.heading(content, "My orders", "Everything you've ordered with this account.")
+        orders = [o for o in self.read_orders() if o.get("username") == self.current_user]
+        if not orders:
+            card = self.panel(content, padx=28, pady=30)
+            card.pack(fill="x", pady=10)
+            self.label(card, "You haven't placed any orders yet.", SUBHEADING, MUTED, bg=CARD).pack(anchor="w")
+            self.button(card, "←  Start shopping", self.show_shop).pack(anchor="w", pady=(18, 0))
+            return
+        table = self.panel(content, padx=10, pady=10)
+        table.pack(fill="both", expand=True)
+        headers = {"id": ("Order ID", 125), "date": ("Date", 160), "items": ("Items", 330),
+                   "total": ("Total", 120), "payment": ("Payment", 140), "status": ("Status", 150)}
+        tree = self.make_tree(table, headers, selectmode="browse")
+        for order in reversed(orders):
+            try:
+                total = money(order.get("total") or 0)
+            except ValueError:
+                total = order.get("total", "")
+            tree.insert("", "end", iid=order.get("order_id", ""),
+                        values=(order.get("order_id", ""), order.get("date", ""), order.get("items", ""),
+                                total, order.get("payment_method", ""), order.get("status", "")))
+        self.attach_order_detail(tree, orders, content)
+        self.button(content, "←  Back to shop", self.show_shop, False).pack(anchor="w", pady=12)
+
+    # ---------------------------------------------------------------- admin
+    def stat_card(self, parent, title, value, color=ACCENT):
+        card = self.panel(parent, padx=18, pady=12)
+        card.pack(side="left", fill="x", expand=True, padx=5)
+        self.label(card, title, SMALL, MUTED, bg=CARD).pack(anchor="w")
+        self.label(card, value, ("Segoe UI", 17, "bold"), color, bg=CARD).pack(anchor="w", pady=(3, 0))
+
+    def show_admin_products(self):
+        if not self.is_admin:
+            return
+        self.clear_screen()
+        self.admin_topbar("products")
+        content = self.content_area()
+        self.heading(content, "Products & stock", "Add or remove products and keep your inventory up to date.")
+
+        orders = self.read_orders()
+        revenue = 0.0
+        for o in orders:
+            try:
+                revenue += float(o.get("total") or 0)
+            except ValueError:
+                pass
+        stats = tk.Frame(content, bg=BG)
+        stats.pack(fill="x", pady=(0, 12))
+        self.stat_card(stats, "PRODUCTS", str(len(self.products)))
+        self.stat_card(stats, "UNITS IN STOCK", str(sum(p["stock"] for p in self.products)), TEAL)
+        self.stat_card(stats, "LOW / OUT OF STOCK", str(sum(1 for p in self.products if p["stock"] <= 5)), AMBER)
+        self.stat_card(stats, "ORDERS", str(len(orders)))
+        self.stat_card(stats, "REVENUE", money(revenue), TEAL)
+
+        table = self.panel(content, padx=10, pady=10)
+        table.pack(fill="both", expand=True)
+        headers = {"id": ("ID", 80), "name": ("Product", 230), "category": ("Category", 170),
+                   "price": ("Price", 150), "stock": ("Stock", 100), "status": ("Status", 160)}
+        tree = self.make_tree(table, headers, selectmode="browse")
+        tree.tag_configure("low", foreground=AMBER)
+        tree.tag_configure("out", foreground=RED)
+        for p in self.products:
+            if p["stock"] <= 0:
+                tag, status = "out", "Out of stock"
+            elif p["stock"] <= 5:
+                tag, status = "low", "Low stock"
+            else:
+                tag, status = "", "In stock"
+            tree.insert("", "end", iid=p["id"], tags=(tag,),
+                        values=(p["id"], f"{p['emoji']}  {p['name']}", p["category"],
+                                money(p["price"]), p["stock"], status))
+
+        controls = tk.Frame(content, bg=BG)
+        controls.pack(fill="x", pady=12)
+        self.button(controls, "＋ Add product", self.admin_add_product, True, True).pack(side="left", padx=(0, 7))
+        self.button(controls, "📥 Add stock", lambda: self.admin_add_stock(tree), False, True).pack(side="left", padx=7)
+        self.button(controls, "✎ Edit price", lambda: self.admin_edit_price(tree), False, True).pack(side="left", padx=7)
+        self.button(controls, "🗑 Delete product", lambda: self.admin_delete_product(tree), False, True, danger=True).pack(side="left", padx=7)
+
+    def admin_selected_product(self, tree):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("Select a product", "Select a product from the table first.")
+            return None
+        return self.product_by_id(selected[0])
+
+    def admin_save_products(self):
+        try:
+            self.save_products()
+            return True
+        except OSError as error:
+            messagebox.showerror("Could not save", f"products.csv could not be written.\n{error}")
+            return False
+
+    def next_product_id(self):
+        numbers = [int(p["id"][1:]) for p in self.products if re.fullmatch(r"P\d+", p["id"])]
+        return "P{:03d}".format(max(numbers, default=0) + 1)
+
+    def admin_add_product(self):
+        win = tk.Toplevel(self)
+        win.title("Add product")
+        win.configure(bg=CARD)
+        win.transient(self)
+        win.resizable(False, False)
+        win.geometry(f"+{self.winfo_rootx() + 330}+{self.winfo_rooty() + 120}")
+        body = tk.Frame(win, bg=CARD, padx=28, pady=24)
+        body.pack()
+        self.label(body, "Add a new product", SUBHEADING, TEXT, bg=CARD).pack(anchor="w", pady=(0, 14))
+
+        def row(text):
+            self.label(body, text, ("Segoe UI", 10, "bold"), TEXT, bg=CARD).pack(anchor="w", pady=(0, 5))
+
+        row("Product name")
+        name_entry = self.dark_entry(body, width=36)
+        name_entry.pack(fill="x", ipady=8, pady=(0, 10))
+        row("Category (pick or type a new one)")
+        cat_var = tk.StringVar()
+        ttk.Combobox(body, textvariable=cat_var, values=self.categories(), width=34).pack(fill="x", ipady=4, pady=(0, 10))
+        row("Price (₹)")
+        price_entry = self.dark_entry(body, width=36)
+        price_entry.pack(fill="x", ipady=8, pady=(0, 10))
+        row("Opening stock")
+        stock_entry = self.dark_entry(body, width=36)
+        stock_entry.insert(0, "10")
+        stock_entry.pack(fill="x", ipady=8, pady=(0, 10))
+        row("Emoji icon (optional)")
+        emoji_entry = self.dark_entry(body, width=36)
+        emoji_entry.pack(fill="x", ipady=8, pady=(0, 16))
+
+        def save():
+            name = name_entry.get().strip()
+            category = cat_var.get().strip()
+            if not name or not category:
+                messagebox.showwarning("Missing details", "Name and category are required.", parent=win)
+                return
+            if any(p["name"].lower() == name.lower() for p in self.products):
+                messagebox.showwarning("Duplicate", "A product with this name already exists.", parent=win)
+                return
+            try:
+                price = float(price_entry.get().strip())
+                stock = int(stock_entry.get().strip())
+                if price <= 0 or stock < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Invalid number", "Price must be above 0 and stock must be 0 or more.", parent=win)
+                return
+            product = {"id": self.next_product_id(), "name": name, "category": category,
+                       "price": price, "stock": stock, "emoji": emoji_entry.get().strip() or "🛍️"}
+            self.products.append(product)
+            if not self.admin_save_products():
+                self.products.remove(product)
+                return
+            win.destroy()
+            self.show_admin_products()
+
+        buttons = tk.Frame(body, bg=CARD)
+        buttons.pack(fill="x")
+        self.button(buttons, "Cancel", win.destroy, False, True).pack(side="left")
+        self.button(buttons, "Add product", save, True, True).pack(side="right")
+        name_entry.focus_set()
+        win.bind("<Return>", lambda event: save())
+        win.grab_set()
+
+    def admin_add_stock(self, tree):
+        product = self.admin_selected_product(tree)
+        if not product:
+            return
+        amount = simpledialog.askinteger("Add stock", f"Units to add to {product['name']}\n(current stock: {product['stock']})",
+                                         parent=self, minvalue=1, maxvalue=100000)
+        if amount is None:
+            return
+        product["stock"] += amount
+        if self.admin_save_products():
+            self.show_admin_products()
+        else:
+            product["stock"] -= amount
+
+    def admin_edit_price(self, tree):
+        product = self.admin_selected_product(tree)
+        if not product:
+            return
+        price = simpledialog.askfloat("Edit price", f"New price for {product['name']} (₹)",
+                                      parent=self, initialvalue=product["price"], minvalue=0.01)
+        if price is None:
+            return
+        old = product["price"]
+        product["price"] = price
+        if self.admin_save_products():
+            self.show_admin_products()
+        else:
+            product["price"] = old
+
+    def admin_delete_product(self, tree):
+        product = self.admin_selected_product(tree)
+        if not product:
+            return
+        if not messagebox.askyesno("Delete product",
+                                   f"Delete '{product['name']}' permanently?\nPast orders will keep their record."):
+            return
+        index = self.products.index(product)
+        self.products.remove(product)
+        if self.admin_save_products():
+            self.show_admin_products()
+        else:
+            self.products.insert(index, product)
+
+    def show_admin_orders(self):
+        if not self.is_admin:
+            return
+        self.clear_screen()
+        self.admin_topbar("orders")
+        content = self.content_area()
+        self.heading(content, "All orders", "Every order placed by customers. Update status as orders move along.")
+        orders = self.read_orders()
+        if not orders:
+            card = self.panel(content, padx=28, pady=30)
+            card.pack(fill="x", pady=10)
+            self.label(card, "No orders have been placed yet.", SUBHEADING, MUTED, bg=CARD).pack(anchor="w")
+            return
+        table = self.panel(content, padx=10, pady=10)
+        table.pack(fill="both", expand=True)
+        headers = {"id": ("Order ID", 115), "date": ("Date", 150), "customer": ("Customer", 130),
+                   "username": ("Username", 110), "items": ("Items", 240), "total": ("Total", 105),
+                   "payment": ("Payment", 120), "status": ("Status", 130)}
+        tree = self.make_tree(table, headers, selectmode="browse")
+        for order in reversed(orders):
+            try:
+                total = money(order.get("total") or 0)
+            except ValueError:
+                total = order.get("total", "")
+            tree.insert("", "end", iid=order.get("order_id", ""),
+                        values=(order.get("order_id", ""), order.get("date", ""), order.get("customer", ""),
+                                order.get("username", ""), order.get("items", ""), total,
+                                order.get("payment_method", ""), order.get("status", "")))
+        self.attach_order_detail(tree, orders, content)
+        controls = tk.Frame(content, bg=BG)
+        controls.pack(fill="x", pady=12)
+        self.label(controls, "Mark selected as:", FONT, MUTED, bg=BG).pack(side="left", padx=(0, 10))
+        for status in ORDER_STATUSES:
+            self.button(controls, status, lambda s=status: self.admin_set_status(tree, s), False, True).pack(side="left", padx=5)
+
+    def admin_set_status(self, tree, status):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showwarning("Select an order", "Select an order first.")
+            return
+        orders = self.read_orders()
+        for order in orders:
+            if order.get("order_id") == selected[0]:
+                order["status"] = status
+        try:
+            self.write_orders(orders)
+        except OSError as error:
+            messagebox.showerror("Could not update", str(error))
+            return
+        self.show_admin_orders()
+
+
+if __name__ == "__main__":
+    app = NovaCartApp()
+    app.mainloop()
